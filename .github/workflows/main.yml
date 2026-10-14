@@ -1,0 +1,86 @@
+name: Compila mod da zip
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      estrai_sorgenti:
+        description: "Estrai anche i sorgenti dello zip nel repository (src, build.gradle, ...)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Se nella radice del repo c'e' uno .zip lo estrae e compila da li'.
+      # Altrimenti compila direttamente i file del repo.
+      - name: Prepara i sorgenti
+        run: |
+          shopt -s nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -gt 0 ]; then
+            echo "Trovato zip: ${zips[0]}"
+            mkdir -p "$RUNNER_TEMP/mod"
+            unzip -q -o "${zips[0]}" -d "$RUNNER_TEMP/mod"
+            bg=$(find "$RUNNER_TEMP/mod" -name build.gradle | head -n 1)
+            if [ -z "$bg" ]; then echo "build.gradle non trovato nello zip"; exit 1; fi
+            echo "SRC=$(dirname "$bg")" >> "$GITHUB_ENV"
+            echo "DA_ZIP=true" >> "$GITHUB_ENV"
+          else
+            if [ ! -f build.gradle ]; then echo "Nessuno zip e nessun build.gradle nel repo"; exit 1; fi
+            echo "SRC=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+            echo "DA_ZIP=false" >> "$GITHUB_ENV"
+          fi
+
+      # Opzionale: metti src, build.gradle ecc. direttamente nel repo (senza .github).
+      - name: Estrai i sorgenti nel repository
+        if: ${{ github.event.inputs.estrai_sorgenti == 'true' && env.DA_ZIP == 'true' }}
+        run: |
+          rsync -a --exclude='.github' "$SRC"/ "$GITHUB_WORKSPACE"/
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -m "Estrai i sorgenti dallo zip" || echo "Niente da committare"
+          git push origin "HEAD:${{ github.ref_name }}"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.1.1'
+
+      - name: Compila
+        run: |
+          cd "$SRC"
+          gradle build --no-daemon
+          mkdir -p "$RUNNER_TEMP/jar-out"
+          cp build/libs/*.jar "$RUNNER_TEMP/jar-out/"
+          ls -la "$RUNNER_TEMP/jar-out"
+
+      # Il jar come artifact (scaricato da Actions dentro uno zip)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viltrumites-mod
+          path: ${{ runner.temp }}/jar-out/*.jar
+
+      # Il jar come file singolo, scaricabile dalla pagina "Releases"
+      - name: Pubblica il .jar nelle Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete ultima-build --yes --cleanup-tag --repo "${{ github.repository }}" || true
+          gh release create ultima-build "$RUNNER_TEMP"/jar-out/*.jar \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Ultima build" \
+            --notes "Jar compilato automaticamente da GitHub Actions."
